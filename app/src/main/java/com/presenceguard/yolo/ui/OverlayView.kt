@@ -11,11 +11,13 @@ import android.graphics.PointF
 import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import com.presenceguard.yolo.core.DetectionSource
 import com.presenceguard.yolo.core.FrameResult
 import com.presenceguard.yolo.core.PersonCandidate
 import com.presenceguard.yolo.core.Roi
+import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -71,7 +73,83 @@ class OverlayView @JvmOverloads constructor(
 
     private var closeHintReady = false
 
+    // ------------------------------------------------------------ 双指缩放（数字裁切）
+
+    /**
+     * 数字裁切倍数。1 表示不裁。
+     *
+     * 这**只影响送进模型的那块像素**，不动任何相机参数 —— 所以它和「焦段」是两回事：
+     * 焦段是换镜头（或传感器级裁切），这里的裁切是纯软件放大，预览画面不会变。
+     * 为了让人不至于迷糊，画面上会画出裁切框，状态栏也分两栏显示。
+     */
+    var cropScale: Float = 1f
+        private set
+
+    /** 裁切倍数变化回调 */
+    var onCropScaleChange: ((Float) -> Unit)? = null
+
+    private val scaleDetector = ScaleGestureDetector(
+        context,
+        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            private var base = 1f
+
+            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                base = cropScale
+                return true
+            }
+
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                // 用倍乘而不是累加：连续捏合时累加会越捏越迟钝
+                val next = (base * detector.scaleFactor).coerceIn(1f, MAX_CROP_SCALE)
+                if (abs(next - cropScale) < 0.005f) return true
+                cropScale = next
+                onCropScaleChange?.invoke(cropScale)
+                invalidate()
+                return true
+            }
+
+            /**
+             * 收到接近 1 的地方就吸附到 1。
+             *
+             * 捏合手势永远不可能精确回到 1.00，差 0.05 就意味着"还在裁切"，
+             * 用户会以为自己已经复位了却一直少看一圈画面。吸附掉这个模糊区间。
+             */
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                if (cropScale < SNAP_TO_ONE_BELOW) resetCrop()
+            }
+        }
+    ).apply {
+        // 关掉"双击快速缩放"：双击在这个界面里太容易误触（用户想点画面看看，
+        // 结果画面自己放大了）。要放大就老老实实捏合。
+        isQuickScaleEnabled = false
+    }
+
+    /** 把裁切倍数恢复到 1（不裁） */
+    fun resetCrop() {
+        if (cropScale == 1f) return
+        cropScale = 1f
+        onCropScaleChange?.invoke(1f)
+        invalidate()
+    }
+
+    fun setCropScale(scale: Float) {
+        cropScale = scale.coerceIn(1f, MAX_CROP_SCALE)
+        invalidate()
+    }
+
     private val density = resources.displayMetrics.density
+
+    /** 数字裁切框外的遮罩：告诉用户这块不参与识别 */
+    private val cropMaskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.parseColor("#99000000")
+    }
+    private val cropBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dp(1.5f)
+        color = Color.parseColor("#B3FFFFFF")
+        pathEffect = DashPathEffect(floatArrayOf(dp(8f), dp(6f)), 0f)
+    }
 
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -205,15 +283,28 @@ class OverlayView @JvmOverloads constructor(
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (!editMode) return false
-        if (event.actionMasked != MotionEvent.ACTION_DOWN) return true
+        if (editMode) {
+            // 画选区时只吃单指取点，不响应缩放：双指落点很容易被当成两个顶点，
+            // 用户会得到一个莫名其妙的三角形。要缩放先退出选区模式。
+            if (event.actionMasked != MotionEvent.ACTION_DOWN) return true
+            handleTap(event.x, event.y)
+            return true
+        }
 
-        val point = toNormalized(event.x, event.y) ?: return true
+        scaleDetector.onTouchEvent(event)
+        if (event.actionMasked == MotionEvent.ACTION_UP) performClick()
+        // 一直返回 true：叠加层下面是 PreviewView，不需要触摸事件。
+        // 上面的控制栏 z 序更高，按钮照常可点。
+        return true
+    }
+
+    private fun handleTap(viewX: Float, viewY: Float) {
+        val point = toNormalized(viewX, viewY) ?: return
 
         // 离上一个顶点太近 = 手指抖动，忽略，否则多边形会退化成一堆重合点
         if (draft.isNotEmpty()) {
             val last = draft.last()
-            if (hypot(point.x - last.x, point.y - last.y) < Roi.MIN_VERTEX_GAP) return true
+            if (hypot(point.x - last.x, point.y - last.y) < Roi.MIN_VERTEX_GAP) return
         }
 
         // 点回起点即闭合
@@ -221,14 +312,13 @@ class OverlayView @JvmOverloads constructor(
             val first = draft.first()
             if (hypot(point.x - first.x, point.y - first.y) < CLOSE_GAP) {
                 finishDraft()
-                return true
+                return
             }
         }
 
         draft += point
         closeHintReady = draft.size >= Roi.MIN_POINTS
         invalidate()
-        return true
     }
 
     override fun performClick(): Boolean {
@@ -286,7 +376,43 @@ class OverlayView @JvmOverloads constructor(
             drawDraft(canvas, geo, scale, offsetX, offsetY)
         }
 
+        drawCropMask(canvas)
         if (editMode) drawEditHint(canvas)
+    }
+
+    /**
+     * 数字裁切框。
+     *
+     * 预览画面本身不会因为数字裁切而变化（相机没动），所以必须显式告诉用户
+     * 「模型现在只能看到框里的这一块」—— 用一个变暗的遮罩 + 细边框。
+     * 框外的东西仍然会显示，但**不参与识别**。
+     */
+    private fun drawCropMask(canvas: Canvas) {
+        val s = cropScale
+        if (s <= 1.01f || width <= 0 || height <= 0) return
+
+        val w = width / s
+        val h = height / s
+        val left = (width - w) / 2f
+        val top = (height - h) / 2f
+
+        canvas.drawRect(0f, 0f, width.toFloat(), top, cropMaskPaint)
+        canvas.drawRect(0f, top + h, width.toFloat(), height.toFloat(), cropMaskPaint)
+        canvas.drawRect(0f, top, left, top + h, cropMaskPaint)
+        canvas.drawRect(left + w, top, width.toFloat(), top + h, cropMaskPaint)
+        canvas.drawRect(left, top, left + w, top + h, cropBorderPaint)
+
+        val label = "数字 ${String.format(java.util.Locale.US, "%.1f", s)}x · 框外不识别"
+        val tw = hintText.measureText(label)
+        val padH = dp(8f)
+        val padV = dp(4f)
+        val boxH = hintText.textSize + padV * 2
+        canvas.drawRoundRect(
+            left + dp(6f), top + dp(6f),
+            left + dp(6f) + tw + padH * 2, top + dp(6f) + boxH,
+            dp(6f), dp(6f), labelBg
+        )
+        canvas.drawText(label, left + dp(6f) + padH, top + dp(6f) + boxH - padV - dp(1f), hintText)
     }
 
     private fun drawRois(canvas: Canvas, geo: Geometry, scale: Float, offsetX: Float, offsetY: Float) {
@@ -447,6 +573,12 @@ class OverlayView @JvmOverloads constructor(
     companion object {
         /** 点回起点的判定半径（归一化）。太小手指够不到，太大会误闭合 */
         private const val CLOSE_GAP = 0.035f
+
+        /** 数字裁切上限，和 FrameAnalyzer.MAX_CROP_SCALE 保持一致 */
+        private const val MAX_CROP_SCALE = 6f
+
+        /** 捏合松手时低于这个倍数就吸附回 1.0（不裁） */
+        private const val SNAP_TO_ONE_BELOW = 1.12f
 
     }
 }

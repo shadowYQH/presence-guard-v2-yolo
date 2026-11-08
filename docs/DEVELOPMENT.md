@@ -25,7 +25,12 @@
 13. [实测性能](#13-实测性能)
 14. [构建与调试](#14-构建与调试)
 15. [已知限制](#15-已知限制)
-16. [版本演进](#16-版本演进)
+16. [双指缩放：数字裁切，不是换镜头](#16-双指缩放数字裁切不是换镜头)
+17. [选区外零计算](#17-选区外零计算)
+18. [瓦片帧差跳过](#18-瓦片帧差跳过)
+19. [2 秒全图巡检与前后双摄](#19-2-秒全图巡检与前后双摄)
+20. [界面布局：为什么把指标行塞进底栏容器](#20-界面布局为什么把指标行塞进底栏容器)
+21. [版本演进](#21-版本演进)
 
 ---
 
@@ -886,13 +891,299 @@ adb shell settings get global low_power                                # 0
 
 4. **多镜头依赖机型暴露**。多数机型只给 1 颗后置相机，此时焦段按钮隐藏。
 
-5. **MIUI 后台限制需要用户手动放行**。见第 10 章。
+5. **前后双摄并发依赖相机 HAL**。本机（M2007J1SC / 865）不支持，自动降级为
+   单镜头巡检，界面显示「巡检 单」。见第 19.3 节。
 
-6. **选区越多，单个选区的判定越慢**。见 9.4。
+6. **双指缩放不增加像素**。数字裁切到 6x 时送进模型的是一小块放大图，
+   和真的长焦不是一回事。要真实增益只能靠「焦段」按钮走光学路径。
+
+7. **MIUI 后台限制需要用户手动放行**。见第 10 章。
+
+8. **选区越多，单个选区的判定越慢**。见 9.4。
 
 ---
 
-## 16. 版本演进
+## 16. 双指缩放：数字裁切，不是换镜头
+
+### 16.1 两条完全不同的"拉近"路径
+
+这是整个应用里最容易被误解的一处，所以代码里刻意做成两条互不相干的路：
+
+| | 焦段按钮（`btnZoom`） | 双指缩放（`OverlayView`） |
+|---|---|---|
+| 实现 | `CameraControl.setZoomRatio()` | `YuvCropper.crop()` 从帧里挖中间一块 |
+| 作用层 | 传感器 / ISP | 送进模型之前的软件裁切 |
+| 预览画面 | **跟着放大** | 不动（只画一个虚线框） |
+| 像素质量 | 真实像素（部分机型还会切长焦） | 像素不增加，放大到极限就是放大模糊 |
+| 检测收益 | 真增益 | 只提高信噪比（背景少了、目标占比大了） |
+| 上限 | 机型决定（本机 10x） | 6x（`MAX_CROP_SCALE`） |
+
+之所以两个都要：物理焦段受机型限制（很多机器的 `availableCameraInfos` 只报一颗后置），
+数字裁切永远可用；而物理焦段在支持的机型上是实打实的画质提升。功能上重叠，收益上不重叠。
+
+### 16.2 为什么裁切要放在 YUV 层
+
+最直觉的写法是 `imageProxy.toBitmap()` 之后 `Bitmap.createBitmap(src, left, top, w, h)`。
+两个问题：
+
+- `toBitmap()` 会把**整帧** 1080×1440 解成 ARGB_8888，约 6MB。裁不裁都一样付这个钱。
+- 再 `createBitmap` 一次，又拷贝一遍。
+
+`YuvCropper` 直接按目标矩形去读 `Plane` 的 buffer，逐像素做 BT.601 limited-range
+YUV→ARGB，**矩形外的像素一个都不碰**：
+
+```kotlin
+object YuvCropper {
+    fun crop(proxy: ImageProxy, rect: Rect): Bitmap?
+}
+```
+
+实测（1080×1440 源帧，见 `cv=` 字段）：
+
+| 取景范围 | 转换耗时 |
+|---|---|
+| 整帧 | 37 ~ 41 ms |
+| 中心 1/3 × 1/3（crop 3.0x） | **17 ms** |
+| 一个选区（约 15% 面积） | **7 ms** |
+
+### 16.3 旋转映射是这里唯一的坑
+
+`ImageProxy` 的 `width/height` 是**传感器坐标系**，而模型和界面要的是**正立坐标系**。
+两者差一个 `imageInfo.rotationDegrees`。`YuvCropper.crop` 收到的 `Rect` 是正立坐标，
+必须自己映射回传感器坐标：
+
+| rotation | 正立 (ox, oy) → 传感器 (x, y) |
+|---|---|
+| 0 | `(ox, oy)` |
+| 90 | `(oy, H-1-ox)` |
+| 180 | `(W-1-ox, H-1-oy)` |
+| 270 | `(W-1-oy, ox)` |
+
+写错一个符号不会崩、不会报错，只会让检测框整体偏移或镜像 —— 而且在小目标上看起来
+"好像还能用"，特别难查。
+
+### 16.4 手势的两个细节
+
+```kotlin
+private val scaleDetector = ScaleGestureDetector(context, listener).apply {
+    isQuickScaleEnabled = false   // 双击快速缩放太容易误触
+}
+```
+
+- **倍乘而非累加**：`next = base * detector.scaleFactor`，`base` 在 `onScaleBegin` 取一次。
+  累加会让连续捏合越捏越迟钝。
+- **松手吸附**：`onScaleEnd` 时 `cropScale < 1.12` 直接归 1。捏合永远回不到精确的 1.00，
+  差 0.05 就等于"还在裁"，用户会以为自己复位了却一直少看一圈画面。
+
+---
+
+## 17. 选区外零计算
+
+需求是"非选区内不做计算、不做识别、不产生无效性能开销"。这句话在实现上有个陷阱：
+**只要还走 `imageProxy.toBitmap()`，选区内外的开销就是一样的**，因为整帧转换已经发生了。
+
+所以选区路线（`FrameAnalyzer.scanRois`）从根上就没有整帧位图：
+
+```kotlin
+for (roi in budgetedRois) {
+    val region = roi.boundsIn(frameWidth, frameHeight)   // 选区的外接矩形
+    val pieces = if (roi.areaRatio() > LARGE_ROI_AREA_RATIO) splitQuadrants(region) else listOf(region)
+    val piece = pieces[roiSubCursor++ % pieces.size]
+    val crop = YuvCropper.crop(imageProxy, piece) ?: fallbackCrop(...)
+    for (c in engine.detectRegion(crop, piece.left, piece.top)) {
+        remap(c, roi, frameWidth, frameHeight)?.let { out += it }
+    }
+}
+```
+
+三个要点：
+
+1. **只转换外接矩形**。多边形内部的孔洞和外接矩形外的区域都不解码。
+2. **大选区切 2×2 轮转**（面积占比 > 6%）。一个占半屏的选区直接缩到 640 送检，
+   远处的人会被压成十几个像素；切成四块轮流送，每块的有效分辨率翻一倍。
+   `QUADRANT_PAD = 0.12` 是外扩量，防止目标正好跨在接缝上被切成两半。
+3. **`remap()` 做回填**。模型吃的是裁出来的图，输出坐标是相对裁切块的；
+   要按 `piece` 的偏移和选区的放大倍率映射回整帧归一化坐标，否则融合层算面积占比会全错。
+
+实测：转换从 41ms 降到 7ms;推理不变（模型输入恒为 640）。
+
+> 所以"选区省性能"这句话要说得准确一点：省的是**转换和无效区域的计算**，
+> 推理成本是固定的（选区 1 个 = 1 次推理，和整帧路线一模一样）。
+> 选区的真正价值是把同样的推理预算**集中**到关心的区域 —— 等效焦距翻几倍，
+> 而不是让单帧变快。要多选区才谈得上省：`roiPerFrame` 限制每帧只扫 N 个，靠游标轮转覆盖。
+
+---
+
+## 18. 瓦片帧差跳过
+
+瓦片路线（灵敏档才开）每扫一片就是一次完整推理，约 320~330ms。监控场景里画面
+绝大多数时间是**静止**的 —— 一个空走廊，两秒之间像素几乎不变，再推一遍纯属浪费。
+
+```kotlin
+private fun shouldScanTile(source: Bitmap, tile: Rect, index: Int): Boolean {
+    val current = fingerprint(source, tile)          // 16×16 灰度采样 = 256 字节
+    val previous = tilePrints[index] ?: return true.also {
+        tilePrints[index] = current; tileSkips[index] = 0
+    }
+    val skips = tileSkips[index] ?: 0
+    // 连着跳过太多次就强制重扫一遍：防止"慢慢走进画面"的人被积分掉
+    if (skips >= FORCE_RESCAN_AFTER) {
+        tilePrints[index] = current; tileSkips[index] = 0; return true
+    }
+    if (meanAbsDiff(previous, current) < MIN_TILE_MAD) {
+        tileSkips[index] = skips + 1
+        return false
+    }
+    tilePrints[index] = current; tileSkips[index] = 0
+    return true
+}
+```
+
+参数：`FP_SIZE = 16`（16×16 灰度）、`MIN_TILE_MAD = 6`（0~255 尺度上的平均绝对差）、
+`FORCE_RESCAN_AFTER = 8`（连续跳过 8 次强制重扫）。
+
+**为什么要 `FORCE_RESCAN_AFTER`**：如果一个人以极慢的速度走进画面，每帧的差异
+可能都低于 6，理论上会被无限跳过。强制重扫把最坏情况压到"最多漏 8 帧"，
+在 2~4fps 下大约是 2~4 秒 —— 配合融合层的滑动窗口投票，不会造成真正的漏报。
+
+实测（灵敏档，瓦片数 1）：
+
+| 帧 | det 总耗时 | 说明 |
+|---|---|---|
+| 首帧 / 画面变化 | 647 ms | 整帧 336 + 瓦片 311 |
+| 画面静止 | 336 ms | 瓦片被跳过，只剩整帧那一次推理 |
+
+日志字段：`tiles=1 skip=1` 表示这一帧有 1 片瓦片、其中 1 片因为帧差过小被跳过。
+
+---
+
+## 19. 2 秒全图巡检与前后双摄
+
+### 19.1 为什么需要它
+
+选区和数字裁切都是"望远镜"：看得清，但看不见旁边。有人绕到取景框外、或者站在
+选区之外，主判定是完全瞎的。所以要有一条**旁路**，定期退回到最广的视野扫一眼。
+
+### 19.2 三条约束
+
+1. **不切镜头**。切物理镜头要 `unbind/rebind`，实测一次约 100ms 且预览会黑一下；
+   每 2 秒闪一次没法用。用"当前镜头 + 无视选区 + 无视数字裁切"的整帧就够了。
+2. **不投票**。巡检结果进独立的 `inspectionFusion`，绝不写回主状态机。
+   把巡检帧当成一帧"没看见人"喂给主融合，会把滑动窗口的票数反复拉低，
+   选区内的人反而更容易判丢。
+3. **不 publish**。巡检帧不触发 `onFrame`，界面上的主判定状态不受影响。
+   结论单独走 `Listener.onInspection`。
+
+### 19.3 前后双摄并发：期望与现实的差距
+
+需求是"前置和后置同时取流、同时运算，避免人走到屏幕背面被漏掉"。CameraX 在
+**1.4.0** 才提供 `ConcurrentCamera` 这套 API（1.3.x 完全没有，这也是本项目把
+`cameraxVersion` 从 1.3.4 升到 1.4.1 的唯一原因）：
+
+```kotlin
+val concurrent = provider.bindToLifecycle(
+    listOf(
+        SingleCameraConfig(primarySelector, primaryGroup, this),
+        SingleCameraConfig(oppositeSelector, secondaryGroup, this)
+    )
+)
+```
+
+但底层要求相机 HAL 声明支持并发流组合。实测本机（小米 M2007J1SC / 骁龙 865）：
+
+```
+W/DetectionService: concurrent bind unsupported, degrade to single camera:
+    Concurrent camera is not supported on the device.
+```
+
+所以流程是「**试 → 失败就降级**」，而不是"先探测再决定"——探测一次同样要开相机，
+成本比试一次还高。降级后的行为：
+
+- 主摄巡检照常（2 秒一次整帧粗判，当前镜头最广视野）；
+- 副摄那条输出流不创建；
+- 界面按钮从「巡检 双」变成「巡检 单」，明确告诉用户现在是单镜头。
+
+副摄一旦绑上，它用的是自己的 `FrameAnalyzer` 实例 + 独立融合引擎，并且打开
+`inspectionOnly` 开关：只有到点那一帧做整帧粗判，其余帧直接丢弃（连位图都不转）。
+
+```kotlin
+@Volatile var inspectionOnly: Boolean = false
+```
+
+### 19.4 为什么共用同一个解释器
+
+副摄和主摄共用同一个 `YoloDetector`。不是图省事，是必须：
+
+- TFLite 的 `Interpreter` **不是线程安全的**，两个线程同时 `run()` 会输出错乱甚至崩；
+- 开两份解释器会让内存翻倍（模型 + 激活值），865 上不划算。
+
+两者都挂在同一个单线程 `cameraExecutor` 上，推理天然串行。"同时获取"在取流层是
+真并发，"同时运算"在推理层是背靠背排队。对 2 秒一次的巡检，这个差别可以忽略。
+
+### 19.5 巡检命中就响
+
+```kotlin
+private fun onInspectionResult(present: Boolean, score: Float, source: String) {
+    notifyListeners { it.onInspection(present, score, source) }
+    if (!present || paused) return
+    if (!settings.audioEnabled) return
+    val now = SystemClock.elapsedRealtime()
+    if (now - lastAlertAt < settings.alertIntervalMs) return
+    lastAlertAt = now
+    alertPlayer.play()
+}
+```
+
+如果只在"主判定已经报警"时才响，这个功能等于什么也没补上。它的全部意义就是
+在**主判定看不见的地方**发现人并报警。和主判定的报警共用 `lastAlertAt`，
+不会出现两条路各响一次的重叠。
+
+### 19.6 省电模式的折中
+
+`dualEyeEnabled() = dualInspect && !powerSave`。多开一条相机输出流是这个功能里
+最贵的一笔，省电时摘掉；但**主摄巡检保留** —— 2 秒一次的整帧粗判只占
+约 300ms/2000ms ≈ 15% 的推理预算，作为"不漏人"的底线值得留。
+
+---
+
+## 20. 界面布局：为什么把指标行塞进底栏容器
+
+原来的写法是指标 `TextView` 用 `layout_gravity="bottom|start"` + `marginBottom="140dp"`
+手动避让控制栏。控制栏加到第三行（焦段/选区/清空）之后，三行按钮撑到约 154dp，
+直接把帧率文字压在按钮底下 —— 手算出来的避让量，按钮一多就失效。
+
+改成结构化布局，让布局系统自己去算：
+
+```xml
+<LinearLayout android:id="@+id/bottomDock"
+    android:layout_gravity="bottom"
+    android:orientation="vertical"
+    android:paddingHorizontal="12dp"
+    android:paddingBottom="16dp">
+
+    <TextView android:id="@+id/metricsText" ... />   <!-- 自然排在按钮上方 -->
+    <LinearLayout android:id="@+id/controlBar" ... />
+</LinearLayout>
+```
+
+指标行 `layout_width="match_parent"` + `maxLines="4"`，诊断串再长也在屏内换行，
+不会撑出屏幕。
+
+**另一个连带的坑**：`OverlayView` 要实现双指缩放，非编辑模式下必须吃掉全部触摸
+（`onTouchEvent` 一律返回 true），否则捏合手势会漏给下层。这导致"暗屏时点一下恢复亮度"
+原来挂在 `binding.root.setOnTouchListener` 上的逻辑**永远收不到事件**。修法是把拦截
+提前到分发之前：
+
+```kotlin
+override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+    if (dimmed) { setDimmed(false); return true }
+    return super.dispatchTouchEvent(ev)
+}
+```
+
+---
+
+## 21. 版本演进
 
 | 版本 | 主题 | 关键结论 |
 |---|---|---|

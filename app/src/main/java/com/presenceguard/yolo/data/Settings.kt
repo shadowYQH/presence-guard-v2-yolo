@@ -42,11 +42,30 @@ class Settings(context: Context) {
             prefs.edit().putLong(KEY_INTERVAL, value.coerceIn(500L, 10000L)).apply()
         }
 
-    /** 摄像头朝向：CameraSelector.LENS_FACING_* */
+    /** 摄像头朝向：CameraSelector.LENS_FACING_*。默认后置 —— 这是"守望"类应用，对着门不是对着自己 */
     var lensFacing: Int
-        get() = prefs.getInt(KEY_LENS, 1)
+        get() = prefs.getInt(KEY_LENS, LENS_BACK)
         set(value) {
             prefs.edit().putInt(KEY_LENS, value).apply()
+        }
+
+    /**
+     * 数字裁切倍数（双指缩放）。
+     *
+     * 和 [zoomRatio] 完全不同：zoomRatio 交给相机做传感器级裁切，会影响预览；
+     * 这里是纯软件裁切，只影响送进模型的像素。两者可以叠加，界面上分开显示。
+     */
+    var cropScale: Float
+        get() = prefs.getFloat(KEY_CROP, 1f).coerceIn(1f, MAX_CROP_SCALE)
+        set(value) {
+            prefs.edit().putFloat(KEY_CROP, value.coerceIn(1f, MAX_CROP_SCALE)).apply()
+        }
+
+    /** 是否每 2 秒做一次「全图 + 另一面摄像头」巡检 */
+    var dualInspect: Boolean
+        get() = prefs.getBoolean(KEY_DUAL_INSPECT, true)
+        set(value) {
+            prefs.edit().putBoolean(KEY_DUAL_INSPECT, value).apply()
         }
 
     /** 省电模式：降低分析帧率、约束 CPU 唤醒 */
@@ -103,6 +122,14 @@ class Settings(context: Context) {
         private const val KEY_ZOOM = "zoom_ratio"
         private const val KEY_LENS_INDEX = "lens_index"
         private const val KEY_ROIS = "rois"
+        private const val KEY_CROP = "crop_scale"
+        private const val KEY_DUAL_INSPECT = "dual_inspect"
+
+        /** CameraSelector.LENS_FACING_BACK */
+        private const val LENS_BACK = 0
+
+        /** 数字裁切上限，和 FrameAnalyzer / OverlayView 里的常量保持一致 */
+        const val MAX_CROP_SCALE = 6f
 
         /** 变焦上限。远超过这个值只是纯数码插值，没有任何新信息 */
         const val MAX_ZOOM = 8f
