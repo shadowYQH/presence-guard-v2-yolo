@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 仅 debug 构建存在的离屏验收探针，正式包不会包含。
+         主题不能用 Theme.NoDisplay —— 那个主题要求 Activity 必须在 onCreate 里 finish，
+         而探针需要一直停在前台，否则量出来的耗时会被后台 cpuset（只有小核）拖慢数倍。 -->
+    <application>
+        <activity
+            android:name=".ProbeActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar" />
+    </application>
+
+</manifest>
